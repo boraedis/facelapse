@@ -1207,7 +1207,12 @@ class Card:
     crooked polaroids for free.
     """
 
-    def __init__(self, row: dict, window: int, eye_frac: float, eye_y: float, rng: np.random.Generator):
+    def __init__(self, row: dict, window: int, eye_frac: float, eye_y: float, rng: np.random.Generator,
+                 centre: tuple[float, float] | None = None):
+        """`centre` makes this the finale card: placed straight and centred on
+        that canvas point instead of eye-aligned with a wobble, so the video
+        ends on one big, square-on photo rather than just another card on
+        the pile."""
         eye_a = np.array([float(row["eye_a_x"]), float(row["eye_a_y"])])
         eye_b = np.array([float(row["eye_b_x"]), float(row["eye_b_y"])])
         mid = (eye_a + eye_b) / 2
@@ -1253,14 +1258,28 @@ class Card:
         self.jitter = rng.normal(0, 0.012 * window, 2)
         self.spin = float(rng.normal(0, 2.0))
         self.entry_spin = float(rng.choice([-1, 1]) * rng.uniform(4, 9))
+        self.entry_scale = 0.14
+        # What the card pivots on and where that point lands: the eyes for a
+        # pile card, the card's own centre for the finale.
+        self.pivot = self.eye
+        self.centre = None
+        if centre is not None:
+            self.tilt = self.spin = 0.0
+            self.jitter = np.zeros(2)
+            self.entry_spin /= 3
+            self.entry_scale = 0.05  # it's already big; don't overshoot the frame
+            self.pivot = np.array([shadow + cw / 2, shadow + ch / 2])
+            self.centre = np.asarray(centre, float)
 
     def matrix(self, target, progress: float) -> np.ndarray:
         """Card -> canvas affine at animation `progress` (0 = appearing, 1 = landed)."""
         ease = 1 - (1 - progress) ** 3
-        scale = 1 + 0.14 * (1 - ease)
+        scale = 1 + self.entry_scale * (1 - ease)
         angle = self.tilt + self.spin + self.entry_spin * (1 - ease)
-        m = cv2.getRotationMatrix2D((float(self.eye[0]), float(self.eye[1])), angle, scale)
-        m[:, 2] += np.asarray(target) + self.jitter - self.eye
+        if self.centre is not None:
+            target = self.centre
+        m = cv2.getRotationMatrix2D((float(self.pivot[0]), float(self.pivot[1])), angle, scale)
+        m[:, 2] += np.asarray(target) + self.jitter - self.pivot
         return m
 
 
@@ -1345,7 +1364,12 @@ def cmd_polaroid(args) -> None:
     frame = None
     for f in range(total):
         while nxt < len(rows) and starts[nxt] <= f:
-            flying.append((nxt, Card(rows[nxt], window, args.eye_dist, 0.42, rng)))
+            if nxt == len(rows) - 1:
+                card = Card(rows[nxt], round(args.finale_window * size), args.finale_eye_dist, 0.4, rng,
+                            centre=(size / 2, size / 2))
+            else:
+                card = Card(rows[nxt], window, args.eye_dist, 0.42, rng)
+            flying.append((nxt, card))
             nxt += 1
         # The last photo lands at half speed: it's the one people see last
         # and it becomes the poster.
@@ -1433,6 +1457,12 @@ def main() -> None:
     # photo's surroundings (places, colour) and less of just a face.
     p.add_argument("--eye-dist", type=float, default=0.11,
                    help="eye spacing as a fraction of the photo window (smaller = zoomed further out)")
+    # The last photo (final.txt) closes the video as one big, straight,
+    # centred print on top of the pile (#458 review).
+    p.add_argument("--finale-window", type=float, default=0.72,
+                   help="last photo's window as a fraction of the video")
+    p.add_argument("--finale-eye-dist", type=float, default=0.1,
+                   help="last photo's eye spacing as a fraction of its window")
     p.add_argument("--edge-rate", type=float, default=5, help="photos/s at the start and end")
     p.add_argument("--peak-rate", type=float, default=22, help="photos/s in the middle")
     p.add_argument("--ramp", type=int, default=12, help="photos spent speeding up / slowing down")

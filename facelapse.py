@@ -1006,25 +1006,42 @@ def cmd_align(args) -> None:
     frames.mkdir()
 
     landmarker = load_landmarker(num_faces=3)
+    done = []
+    for i, row in enumerate(rows, 1):
+        _, upright = load_image(Path(row["path"]))
+        rgb = np.asarray(upright)
+        eye_a = (float(row["eye_a_x"]), float(row["eye_a_y"]))
+        eye_b = (float(row["eye_b_x"]), float(row["eye_b_y"]))
+        if not args.no_refine:
+            eye_a, eye_b, ok = refine_eyes(landmarker, rgb, eye_a, eye_b)
+            if not ok:
+                log(f"  refine found no face, using scan points: {row['path']}")
+        out = frames / f"{i:05d}.jpg"
+        Image.fromarray(framing.warp(rgb, eye_a, eye_b)).save(out, quality=93)
+        done.append((out, row, eye_a, eye_b))
+        if i % 25 == 0 or i == len(rows):
+            log(f"  aligned {i}/{len(rows)}")
+
+    corrections = [(1.0, 0.0, 0.0)] * len(done)
+    if args.color > 0:
+        corrections = colour_corrections([d[0] for d in done], framing, args.color)
+        for (path, *_), corr in zip(done, corrections):
+            rgb = np.asarray(Image.open(path).convert("RGB"))
+            Image.fromarray(apply_colour(rgb, corr)).save(path, quality=93)
+        log(f"  colour balanced {len(done)} frames toward the median face (strength {args.color})")
+
+    # frames.csv also carries the refined eye points and each photo's colour
+    # correction, so `polaroid` can rebuild cards from the original photos
+    # (at its own zoom, without the full view's filled-in edges) and still
+    # match the full view's alignment and colour exactly.
     with (work / "frames.csv").open("w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["frame", "taken", "path"])
-        for i, row in enumerate(rows, 1):
-            _, upright = load_image(Path(row["path"]))
-            rgb = np.asarray(upright)
-            eye_a = (float(row["eye_a_x"]), float(row["eye_a_y"]))
-            eye_b = (float(row["eye_b_x"]), float(row["eye_b_y"]))
-            if not args.no_refine:
-                eye_a, eye_b, ok = refine_eyes(landmarker, rgb, eye_a, eye_b)
-                if not ok:
-                    log(f"  refine found no face, using scan points: {row['path']}")
-            out = frames / f"{i:05d}.jpg"
-            Image.fromarray(framing.warp(rgb, eye_a, eye_b)).save(out, quality=93)
-            w.writerow([out.name, row["taken"], row["path"]])
-            if i % 25 == 0 or i == len(rows):
-                log(f"  aligned {i}/{len(rows)}")
-    if args.color > 0:
-        balance_colour(sorted(frames.glob("*.jpg")), framing, args.color)
+        w.writerow(["frame", "taken", "path", "eye_a_x", "eye_a_y", "eye_b_x", "eye_b_y",
+                    "gamma", "shift_a", "shift_b"])
+        for (out, row, eye_a, eye_b), (gamma, sa, sb) in zip(done, corrections):
+            w.writerow([out.name, row["taken"], row["path"],
+                        *(round(float(v), 2) for v in (*eye_a, *eye_b)),
+                        round(gamma, 4), round(sa, 3), round(sb, 3)])
     log(f"Frames: {frames}")
 
 
@@ -1039,43 +1056,51 @@ def face_mask(framing: Framing) -> np.ndarray:
     return mask > 0
 
 
-def balance_colour(paths: list[Path], framing: Framing, strength: float) -> None:
-    """Pull each frame's face brightness, contrast and colour cast toward the
-    median across all frames, in Lab space.
+def colour_corrections(paths: list[Path], framing: Framing, strength: float) -> list[tuple[float, float, float]]:
+    """Per-frame (gamma, a shift, b shift) pulling each face's brightness and
+    colour cast toward the median across all frames, in Lab space, already
+    scaled by `strength` (0 = untouched, 1 = fully matched; a little left
+    over keeps it from looking processed).
 
     Brightness (L) is corrected with a gamma curve chosen to move the face's
     mean to the target, not a linear gain: gamma fixes 0 and 100, so on a
     backlit shot the face comes up without blowing the sky behind it to
-    white (a linear gain did exactly that on the first render). Colour (a, b) gets a
-    mean shift only: it removes warm/cool/green casts from different cameras
-    and lighting without flattening real skin-tone differences (a summer tan
-    is part of the story). `strength` blends between untouched (0) and fully
-    matched (1); a little left over keeps it from looking processed.
+    white (a linear gain did exactly that on the first render). Colour (a, b)
+    gets a mean shift only: it removes warm/cool/green casts from different
+    cameras and lighting without flattening real skin-tone differences (a
+    summer tan is part of the story).
     """
     mask = face_mask(framing)
-    stats = []
+    means = []
     for p in paths:
         lab = cv2.cvtColor(np.asarray(Image.open(p).convert("RGB")).astype(np.float32) / 255, cv2.COLOR_RGB2LAB)
-        face = lab[mask]
-        stats.append((face.mean(axis=0), face.std(axis=0)))
-    means = np.array([m for m, _ in stats])
-    target_mean = np.median(means, axis=0)
-
-    for p, (mean, _std) in zip(paths, stats):
-        rgb = np.asarray(Image.open(p).convert("RGB")).astype(np.float32) / 255
-        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+        means.append(lab[mask].mean(axis=0))
+    means = np.array(means)
+    target = np.median(means, axis=0)
+    out = []
+    for mean in means:
         # L' = 100 * (L/100)^g maps the face mean onto the target. Clamped:
         # a near-black face can't be rescued without dragging up noise.
-        m, t = np.clip([mean[0], target_mean[0]], 1, 99) / 100
+        m, t = np.clip([mean[0], target[0]], 1, 99) / 100
         gamma = float(np.clip(math.log(t) / math.log(m), 0.5, 2.0))
-        fixed = lab.copy()
-        fixed[..., 0] = 100 * np.power(np.clip(lab[..., 0], 0, 100) / 100, gamma)
-        fixed[..., 1:] = lab[..., 1:] - mean[1:] + target_mean[1:]
-        lab = lab + strength * (fixed - lab)
-        lab[..., 0] = np.clip(lab[..., 0], 0, 100)
-        out = np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1)
-        Image.fromarray((out * 255 + 0.5).astype(np.uint8)).save(p, quality=93)
-    log(f"  colour balanced {len(paths)} frames toward the median face (strength {strength})")
+        # Strength applied in gamma's log space so 0.5 is "halfway" in feel.
+        gamma = float(gamma ** strength)
+        shift = (target[1:] - mean[1:]) * strength
+        out.append((gamma, float(shift[0]), float(shift[1])))
+    return out
+
+
+def apply_colour(rgb: np.ndarray, correction: tuple[float, float, float]) -> np.ndarray:
+    """Apply one frame's (gamma, a shift, b shift) to a uint8 RGB array."""
+    gamma, sa, sb = correction
+    if gamma == 1 and sa == 0 and sb == 0:
+        return rgb
+    lab = cv2.cvtColor(rgb.astype(np.float32) / 255, cv2.COLOR_RGB2LAB)
+    lab[..., 0] = 100 * np.power(np.clip(lab[..., 0], 0, 100) / 100, gamma)
+    lab[..., 1] += sa
+    lab[..., 2] += sb
+    out = np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1)
+    return (out * 255 + 0.5).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -1136,6 +1161,204 @@ def cmd_encode(args) -> None:
 
 
 # ---------------------------------------------------------------------------
+# polaroid
+# ---------------------------------------------------------------------------
+
+# The landing page's --background tokens (src/app/globals.css), light and
+# dark, so the stack sits on the page instead of in a visible box.
+POLAROID_BG = {"light": "#fefbf7", "dark": "#130b08"}
+CARD_WHITE = (255, 255, 252)
+
+
+def hex_rgb(value: str) -> tuple[int, int, int]:
+    value = value.lstrip("#")
+    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+
+
+class Card:
+    """One photo as a polaroid, premultiplied RGBA, axis-aligned to the
+    photo's own edges, plus where its eye midpoint sits on it.
+
+    The picture is only the part of the photo that really exists inside the
+    zoomed-out window around your face, so a face near a photo's edge makes a
+    narrower card instead of a smeared fill (the full view has to fill a
+    square; a polaroid doesn't). The card is later rotated by the photo's own
+    tilt, which is what levels the eyes, so crooked phone shots land as
+    crooked polaroids for free.
+    """
+
+    def __init__(self, row: dict, window: int, eye_frac: float, eye_y: float, rng: np.random.Generator):
+        eye_a = np.array([float(row["eye_a_x"]), float(row["eye_a_y"])])
+        eye_b = np.array([float(row["eye_b_x"]), float(row["eye_b_y"])])
+        mid = (eye_a + eye_b) / 2
+        axis = eye_b - eye_a
+        scale = eye_frac * window / float(np.hypot(*axis))
+        self.tilt = math.degrees(math.atan2(axis[1], axis[0]))
+
+        _, upright = load_image(Path(row["path"]))
+        src_w, src_h = upright.size
+        side = window / scale
+        x0, x1 = max(0.0, mid[0] - side / 2), min(float(src_w), mid[0] + side / 2)
+        y0, y1 = max(0.0, mid[1] - eye_y * side), min(float(src_h), mid[1] + (1 - eye_y) * side)
+        crop = upright.crop((round(x0), round(y0), round(x1), round(y1)))
+        size = (max(1, round(crop.width * scale)), max(1, round(crop.height * scale)))
+        crop = crop.resize(size, Image.LANCZOS)
+        rgb = apply_colour(np.asarray(crop), (float(row["gamma"]), float(row["shift_a"]), float(row["shift_b"])))
+
+        # Polaroid proportions: thin even border, deep bottom lip.
+        side_b = round(0.035 * window)
+        bottom_b = round(0.13 * window)
+        shadow = round(0.05 * window)
+        cw, ch = size[0] + 2 * side_b, size[1] + side_b + bottom_b
+        w, h = cw + 2 * shadow, ch + 2 * shadow
+        img = np.zeros((h, w, 4), np.float32)
+        # Soft drop shadow, offset down a touch as if lit from above. Kept as
+        # its own layer: at full strength under all ~250 cards the shadows
+        # stacked into a black rim round the pile, so only the card that's
+        # landing casts a real shadow and settled cards keep a faint one.
+        sh = np.zeros((h, w), np.float32)
+        off = round(0.25 * shadow)
+        sh[shadow + off:shadow + off + ch, shadow:shadow + cw] = 0.3
+        self.shadow = np.zeros((h, w, 4), np.float32)
+        self.shadow[..., 3] = cv2.GaussianBlur(sh, (0, 0), shadow / 2.5)
+        img[shadow:shadow + ch, shadow:shadow + cw, :3] = np.array(CARD_WHITE, np.float32) / 255
+        img[shadow:shadow + ch, shadow:shadow + cw, 3] = 1
+        px, py = shadow + side_b, shadow + side_b
+        img[py:py + size[1], px:px + size[0], :3] = rgb.astype(np.float32) / 255
+        img[..., :3] *= img[..., 3:4]  # premultiply
+        self.img = img
+        self.eye = np.array([px + (mid[0] - x0) * scale, py + (mid[1] - y0) * scale])
+        # Small hand-placed wobble on top of the alignment, so the pile reads
+        # as a stack of prints rather than one flickering frame.
+        self.jitter = rng.normal(0, 0.012 * window, 2)
+        self.spin = float(rng.normal(0, 2.0))
+        self.entry_spin = float(rng.choice([-1, 1]) * rng.uniform(4, 9))
+
+    def matrix(self, target, progress: float) -> np.ndarray:
+        """Card -> canvas affine at animation `progress` (0 = appearing, 1 = landed)."""
+        ease = 1 - (1 - progress) ** 3
+        scale = 1 + 0.14 * (1 - ease)
+        angle = self.tilt + self.spin + self.entry_spin * (1 - ease)
+        m = cv2.getRotationMatrix2D((float(self.eye[0]), float(self.eye[1])), angle, scale)
+        m[:, 2] += np.asarray(target) + self.jitter - self.eye
+        return m
+
+
+def composite(canvas: np.ndarray, card: Card, m: np.ndarray, alpha: float, shadow: float) -> None:
+    """Draw a card's shadow (scaled by `shadow`) then the card itself onto a
+    float RGB canvas, in place."""
+    if shadow > 0:
+        over(canvas, card.shadow, m, alpha * shadow)
+    over(canvas, card.img, m, alpha)
+
+
+def over(canvas: np.ndarray, layer: np.ndarray, m: np.ndarray, alpha: float) -> None:
+    """Premultiplied 'over' of a warped RGBA layer onto the canvas, touching
+    only the layer's bounding box."""
+    h, w = layer.shape[:2]
+    corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], np.float64) @ m[:, :2].T + m[:, 2]
+    x0, y0 = np.floor(corners.min(axis=0)).astype(int)
+    x1, y1 = np.ceil(corners.max(axis=0)).astype(int)
+    x0, y0 = max(x0, 0), max(y0, 0)
+    x1, y1 = min(x1, canvas.shape[1]), min(y1, canvas.shape[0])
+    if x1 <= x0 or y1 <= y0:
+        return
+    local = m.copy()
+    local[:, 2] -= (x0, y0)
+    warped = cv2.warpAffine(layer, local, (x1 - x0, y1 - y0), flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+    if alpha < 1:
+        warped *= alpha
+    region = canvas[y0:y1, x0:x1]
+    region *= 1 - warped[..., 3:4]
+    region += warped[..., :3]
+
+
+def schedule(n: int, fps: float, edge_rate: float, peak_rate: float, ramp: int) -> list[float]:
+    """Start time (in video frames) of each photo: `edge_rate` photos/s at
+    both ends easing to `peak_rate` in the middle, so it opens readably,
+    rushes through the years, and slows to land on the latest photo."""
+    starts, t = [], 0.0
+    for i in range(n):
+        starts.append(t)
+        k = min(1.0, min(i, n - 1 - i) / max(ramp, 1))
+        k = k * k * (3 - 2 * k)  # smoothstep
+        rate = edge_rate + (peak_rate - edge_rate) * k
+        t += fps / rate
+    return starts
+
+
+def cmd_polaroid(args) -> None:
+    work = Path(args.work)
+    frames_csv = work / "frames.csv"
+    if not frames_csv.exists():
+        sys.exit(f"No {frames_csv}; run `align` first.")
+    rows = list(csv.DictReader(frames_csv.open()))
+    if not rows or "gamma" not in rows[0]:
+        sys.exit("frames.csv is from an older version; re-run `align`.")
+    if not shutil.which("ffmpeg"):
+        sys.exit("ffmpeg not found; `brew install ffmpeg`.")
+
+    size, fps = args.size, 30.0
+    window = round(args.window * size)
+    # Eyes a little above centre, so the deep polaroid lip below doesn't push
+    # the stack off the bottom.
+    target = np.array([size / 2, size * 0.43])
+    bg = np.array(hex_rgb(POLAROID_BG.get(args.bg, args.bg)), np.float32) / 255
+    rng = np.random.default_rng(args.seed)
+    starts = schedule(len(rows), fps, args.edge_rate, args.peak_rate, args.ramp)
+    land = args.land_frames
+    total = int(math.ceil(starts[-1] + land * 2 + args.hold * fps))
+
+    out_path = work / f"polaroid-{args.bg.lstrip('#')}.mp4"
+    ffmpeg = subprocess.Popen(
+        ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+         "-s", f"{size}x{size}", "-r", str(fps), "-i", "-",
+         "-c:v", "libx264", "-preset", "slow", "-crf", str(args.crf), "-pix_fmt", "yuv420p",
+         "-movflags", "+faststart", "-an", str(out_path)],
+        stdin=subprocess.PIPE,
+    )
+    pile = np.empty((size, size, 3), np.float32)
+    pile[:] = bg
+    flying: list[tuple[int, Card]] = []
+    nxt = 0
+    frame = None
+    for f in range(total):
+        while nxt < len(rows) and starts[nxt] <= f:
+            flying.append((nxt, Card(rows[nxt], window, args.eye_dist, 0.42, rng)))
+            nxt += 1
+        # The last photo lands at half speed: it's the one people see last
+        # and it becomes the poster.
+        def duration(i):
+            return land * 2 if i == len(rows) - 1 else land
+        still = []
+        for i, card in flying:
+            if (f - starts[i]) / duration(i) >= 1:
+                composite(pile, card, card.matrix(target, 1.0), 1.0, shadow=0.15)
+            else:
+                still.append((i, card))
+        flying = still
+        frame = pile.copy()
+        for i, card in flying:
+            prog = max(0.0, (f - starts[i]) / duration(i))
+            # Fully opaque from the first frame: at ~20 photos/s a new card
+            # starts almost every frame, so any fade-in (even over one frame)
+            # left nearly every frame with a see-through card ghosting over
+            # the one below. The drop reads from the scale and spin instead.
+            composite(frame, card, card.matrix(target, prog), 1.0, shadow=1.0)
+        ffmpeg.stdin.write((np.clip(frame, 0, 1) * 255 + 0.5).astype(np.uint8).tobytes())
+        if f % 60 == 0:
+            log(f"  frame {f}/{total}  ({nxt}/{len(rows)} photos in)")
+    ffmpeg.stdin.close()
+    ffmpeg.wait()
+    poster = Image.fromarray((np.clip(frame, 0, 1) * 255 + 0.5).astype(np.uint8))
+    stem = out_path.stem
+    poster.save(work / f"{stem}-poster.jpg", quality=88)
+    poster.save(work / f"{stem}-poster.webp", quality=82)
+    log(f"{len(rows)} photos, {total / fps:.1f}s → {out_path}  {out_path.stat().st_size / 1e6:.2f} MB")
+
+
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -1174,6 +1397,25 @@ def main() -> None:
     p.add_argument("--crf", type=int, default=24, help="x264 quality (lower = bigger, sharper)")
     p.add_argument("--webm", action="store_true", help="also write a VP9 WebM")
     p.set_defaults(fn=cmd_encode)
+
+    # The hero version (#457): each photo drops onto a growing pile of
+    # polaroids, eye-aligned, faster than the full view and zoomed further
+    # out. Reads frames.csv from `align` but crops the original photos itself.
+    p = sub.add_parser("polaroid", help="render the stacked-polaroid version")
+    p.add_argument("--bg", default="light", help="'light', 'dark' (the site's backgrounds) or a #hex colour")
+    p.add_argument("--size", type=int, default=1080, help="square video size in px")
+    p.add_argument("--window", type=float, default=0.62,
+                   help="photo window width as a fraction of the video (the card adds its border)")
+    p.add_argument("--eye-dist", type=float, default=0.15,
+                   help="eye spacing as a fraction of the photo window (smaller = zoomed further out)")
+    p.add_argument("--edge-rate", type=float, default=5, help="photos/s at the start and end")
+    p.add_argument("--peak-rate", type=float, default=22, help="photos/s in the middle")
+    p.add_argument("--ramp", type=int, default=12, help="photos spent speeding up / slowing down")
+    p.add_argument("--land-frames", type=int, default=7, help="frames (at 30fps) a card takes to land")
+    p.add_argument("--hold", type=float, default=2.0, help="seconds to hold the finished pile")
+    p.add_argument("--crf", type=int, default=23)
+    p.add_argument("--seed", type=int, default=7, help="wobble seed; same seed = same pile")
+    p.set_defaults(fn=cmd_polaroid)
 
     args = parser.parse_args()
     args.fn(args)

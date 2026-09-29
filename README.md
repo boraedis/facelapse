@@ -78,6 +78,13 @@ $PY facelapse.py encode --blend    # work/facelapse.mp4 + poster.jpg/.webp
   (gamma, so backgrounds don't blow out) and colour cast are pulled toward the
   median frame. `--color 0` turns it off, `--color 1` matches fully (default 0.8).
 - **encode** plays 12 photos a second by default (`--fps`).
+- **polaroid** renders the landing-page hero version: each photo drops onto a
+  growing pile of polaroids, eye-aligned, speeding up through the middle
+  (`--edge-rate`/`--peak-rate`) and landing on the latest photo. Cards show
+  only the real part of each photo around the face (`--eye-dist` sets the
+  zoom), so nothing is filled in. `--bg light|dark` matches the site's two
+  themes; writes `work/polaroid-<bg>.mp4` and a poster of the finished pile.
+  Run `align` first.
 - Turning heads toward the camera was tried and dropped: warping a 2D photo
   around a 3D pose visibly distorted eyes and cheeks, even at partial strength.
 - The filter thresholds are constants at the top of `facelapse.py`.

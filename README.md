@@ -74,6 +74,12 @@ $PY facelapse.py encode --blend    # work/facelapse.mp4 + poster.jpg/.webp
   persist, so this year's choices carry over to next year's run.
 - Framing (`--width/--height/--eye-y/--eye-dist`) must be the same for
   `select` and `align`.
+- **align** also evens out lighting and colour: each frame's face brightness
+  (gamma, so backgrounds don't blow out) and colour cast are pulled toward the
+  median frame. `--color 0` turns it off, `--color 1` matches fully (default 0.8).
+- **encode** plays 12 photos a second by default (`--fps`).
+- Turning heads toward the camera was tried and dropped: warping a 2D photo
+  around a 3D pose visibly distorted eyes and cheeks, even at partial strength.
 - The filter thresholds are constants at the top of `facelapse.py`.
 
 ## Checked on synthetic data

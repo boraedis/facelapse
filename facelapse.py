@@ -1009,7 +1009,59 @@ def cmd_align(args) -> None:
             w.writerow([out.name, row["taken"], row["path"]])
             if i % 25 == 0 or i == len(rows):
                 log(f"  aligned {i}/{len(rows)}")
+    if args.color > 0:
+        balance_colour(sorted(frames.glob("*.jpg")), framing, args.color)
     log(f"Frames: {frames}")
+
+
+def face_mask(framing: Framing) -> np.ndarray:
+    """Ellipse covering brows to chin. Every frame is aligned, so the face is
+    in the same place in all of them; measuring only there keeps a bright sky
+    or a dark bar behind you from driving the correction."""
+    mask = np.zeros((framing.height, framing.width), np.uint8)
+    cx = round(framing.width / 2)
+    cy = round(framing.eye_a[1] + 0.5 * framing.eye_px)
+    cv2.ellipse(mask, (cx, cy), (round(0.9 * framing.eye_px), round(1.3 * framing.eye_px)), 0, 0, 360, 255, -1)
+    return mask > 0
+
+
+def balance_colour(paths: list[Path], framing: Framing, strength: float) -> None:
+    """Pull each frame's face brightness, contrast and colour cast toward the
+    median across all frames, in Lab space.
+
+    Brightness (L) is corrected with a gamma curve chosen to move the face's
+    mean to the target, not a linear gain: gamma fixes 0 and 100, so on a
+    backlit shot the face comes up without blowing the sky behind it to
+    white (a linear gain did exactly that on the first render). Colour (a, b) gets a
+    mean shift only: it removes warm/cool/green casts from different cameras
+    and lighting without flattening real skin-tone differences (a summer tan
+    is part of the story). `strength` blends between untouched (0) and fully
+    matched (1); a little left over keeps it from looking processed.
+    """
+    mask = face_mask(framing)
+    stats = []
+    for p in paths:
+        lab = cv2.cvtColor(np.asarray(Image.open(p).convert("RGB")).astype(np.float32) / 255, cv2.COLOR_RGB2LAB)
+        face = lab[mask]
+        stats.append((face.mean(axis=0), face.std(axis=0)))
+    means = np.array([m for m, _ in stats])
+    target_mean = np.median(means, axis=0)
+
+    for p, (mean, _std) in zip(paths, stats):
+        rgb = np.asarray(Image.open(p).convert("RGB")).astype(np.float32) / 255
+        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+        # L' = 100 * (L/100)^g maps the face mean onto the target. Clamped:
+        # a near-black face can't be rescued without dragging up noise.
+        m, t = np.clip([mean[0], target_mean[0]], 1, 99) / 100
+        gamma = float(np.clip(math.log(t) / math.log(m), 0.5, 2.0))
+        fixed = lab.copy()
+        fixed[..., 0] = 100 * np.power(np.clip(lab[..., 0], 0, 100) / 100, gamma)
+        fixed[..., 1:] = lab[..., 1:] - mean[1:] + target_mean[1:]
+        lab = lab + strength * (fixed - lab)
+        lab[..., 0] = np.clip(lab[..., 0], 0, 100)
+        out = np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1)
+        Image.fromarray((out * 255 + 0.5).astype(np.uint8)).save(p, quality=93)
+    log(f"  colour balanced {len(paths)} frames toward the median face (strength {strength})")
 
 
 # ---------------------------------------------------------------------------
@@ -1096,10 +1148,13 @@ def main() -> None:
     p = sub.add_parser("align", help="warp selected photos into eye-aligned frames")
     add_framing_args(p)
     p.add_argument("--no-refine", action="store_true", help="skip the full-res eye re-detection")
+    p.add_argument("--color", type=float, default=0.8,
+                   help="pull face brightness/colour toward the median frame (0 = off, 1 = full)")
     p.set_defaults(fn=cmd_align)
 
     p = sub.add_parser("encode", help="frames → MP4 (+ optional WebM) and poster")
-    p.add_argument("--fps", type=float, default=8, help="photos per second")
+    # 12/s, up from 8 after the first real render (#457) read as too slow.
+    p.add_argument("--fps", type=float, default=12, help="photos per second")
     p.add_argument("--hold", type=float, default=1.5, help="seconds to hold the final frame")
     p.add_argument("--blend", action="store_true", help="crossfade between photos")
     p.add_argument("--crf", type=int, default=24, help="x264 quality (lower = bigger, sharper)")

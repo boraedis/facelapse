@@ -11,7 +11,10 @@ the app itself.
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 mkdir -p models && curl -L -o models/face_landmarker.task \
   https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task
+curl -L -o models/face_recognition_sface_2021dec.onnx \
+  https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx
 brew install ffmpeg
+mkdir -p work/me && cp ~/path/to/a-clear-recent-photo-of-you.jpg work/me/
 ```
 
 ## Getting the photos out of Google Photos
@@ -26,8 +29,20 @@ brew install ffmpeg
    the embedded photo date has been stripped.
 
 Older photos from other places (for example high-school ones) can simply be
-another folder. `scan` takes several folders at once. Undated photos need a
-date in the filename (`20090315_anything.jpg`).
+another folder. `scan` takes several folders at once.
+
+Dates come from, in order: a Takeout `.json` file, the photo's own embedded
+date, or the filename (`20090315_…`, or Photo Booth's `Photo on 9-25-17 at 12.42 PM`).
+For anything still undated, add a line to `work/dates.txt`:
+
+```
+IMG_4890.JPG            2017-06
+IMG_2455.heic           2019
+```
+
+Mac Photo Booth saves mirror images. Files it named (`Photo on …`, `4-up on …`)
+are flipped back automatically, so your face doesn't swap sides between those
+frames and camera frames.
 
 ## Running it
 
@@ -41,12 +56,19 @@ $PY facelapse.py encode --blend    # work/facelapse.mp4 + poster.jpg/.webp
 
 - **scan** caches its results in `work/scan.jsonl`. It can be resumed after a
   Ctrl-C, and next year it only processes the new photos.
-- **select** removes group shots, turned or tilted heads, closed eyes, tiny
-  faces, and faces too close to the photo's edge. It then scores the rest
-  (how front-facing, sharpness, resolution, eyes open) and keeps the best
-  photo per month (`--period week|month|quarter|year`).
-- **review.html** shows each period's pick (green) next to its runners-up,
-  already cropped the way the final frame will be. The pin and exclude
+- **select** first works out which face in each photo is you. It starts
+  from the photos in `work/me/`, then learns more of your faces by linking
+  through similar-looking photos, so childhood photos get recognised from an
+  adult reference. It then removes photos with someone else inside the
+  cropped frame, turned or tilted heads, closed eyes, tiny faces, and faces
+  too close to the photo's edge.
+- By default every usable photo becomes a frame, in date order. Shots taken
+  in the same minute (bursts, duplicate copies) collapse to the best one. For
+  an even pace through time, use `--period week|month|quarter|year` instead
+  to keep only the best photo per period.
+- **review.html** shows each month's frames (green), already cropped the
+  way the final frame will be, with that month's rejected photos (uncropped,
+  with the reason) folded underneath, and undated photos at the end. The pin and exclude
   buttons collect file paths into the boxes at the top. Paste them into
   `work/pin.txt` or `work/exclude.txt` and run `select` again. Both files
   persist, so this year's choices carry over to next year's run.
@@ -61,4 +83,8 @@ Tested on copies of one portrait that were rotated (−9° to +12°), scaled
 through a Takeout JSON file with a truncated name. On every output frame, the
 re-detected eyes landed within 2.4px of the target on a 1080px canvas. The
 undated copy, the blank image, and the 0.6× copy (face too small) were
-rejected. The group-photo filter hasn't been tested yet.
+rejected.
+
+On a real set of 179 photos (2004–2026, mostly 2016–18 Photo Booth shots,
+many with a friend in the frame), the right person was picked in every
+frame on the contact sheet, including a 2005 childhood photo.

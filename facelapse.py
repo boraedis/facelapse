@@ -3,27 +3,31 @@
 
 Built for data-diary#457 (the landing-page facelapse, epic #15). Deliberately
 a standalone offline tool, not part of the data-diary app: it runs maybe once
-a year, on a laptop, against a local Google Photos export.
+a year, on a laptop, against a local folder of exported photos.
 
 Pipeline (each step reads the previous step's output from --work):
 
   scan    Walk one or more photo folders, date every photo, detect faces with
-          MediaPipe, and cache per-photo measurements in scan.jsonl. Resumable
-          and incremental: a re-run only processes new or changed files.
-  select  Filter out unusable shots (group photos, profiles, closed eyes, tiny
-          faces), score the rest, and pick the best photo per period. Writes
-          selection.csv plus review.html, a contact sheet for checking picks.
+          MediaPipe, and fingerprint each face (OpenCV SFace) so `select` can
+          tell you apart from friends. Cached in scan.jsonl; a re-run only
+          processes new or changed files.
+  select  Work out which face in each photo is you, filter out unusable shots
+          (someone else in frame, turned heads, closed eyes, tiny faces), and
+          keep every usable photo in date order (or the best per period).
+          Writes selection.csv plus review.html, a contact sheet of picks and
+          rejects.
   align   Re-detect eyes precisely on each selected photo and warp it so the
           eyes land on fixed canvas coordinates. Writes frames/ + frames.csv.
   encode  ffmpeg the frames into an MP4 (optionally WebM) plus a poster image
           of the final frame.
 
-Manual control lives in two plain-text files in --work, one path per line,
-both honoured by `select` on every run so choices survive a yearly re-run:
+Files you maintain in --work, all honoured by `select` on every run so choices
+survive a yearly re-run:
 
-  exclude.txt   never use these photos
-  pin.txt       always use these photos (a pinned photo wins its period; pin
-                several in one period to keep all of them, e.g. sparse years)
+  me/           one or more clear, recent photos of you: the identity seed
+  exclude.txt   never use these photos (one path or file name per line)
+  pin.txt       always use these photos, overriding the quality filters
+  dates.txt     `<file name or path>  YYYY[-MM[-DD]]` for photos with no date
 
 Alignment is eyes-only (decision 5 on #15): mouth position moves with
 expression, so pinning it as a second anchor fights the eye alignment.
@@ -43,7 +47,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import cv2
@@ -60,7 +64,12 @@ pillow_heif.register_heif_opener()
 
 ROOT = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "models" / "face_landmarker.task"
+SFACE_PATH = ROOT / "models" / "face_recognition_sface_2021dec.onnx"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp"}
+
+# Bump when scan's output changes shape or meaning; older cache lines are
+# rescanned. v2: face embeddings, Photo Booth dates, Photo Booth un-mirroring.
+SCAN_VERSION = 2
 
 # Detection runs on a downscaled copy: MediaPipe's detector works at a few
 # hundred px internally anyway, and decoding + scanning thousands of 12MP
@@ -76,13 +85,37 @@ REFINE_CROP_SIDE = 768
 EYE_A_CORNERS = (33, 133)   # subject's right eye (image left)
 EYE_B_CORNERS = (362, 263)  # subject's left eye (image right)
 NOSE_TIP = 1
+MOUTH_A = 61                # mouth corner, image left
+MOUTH_B = 291               # mouth corner, image right
 CHEEK_A = 234
 CHEEK_B = 454
 
+# Mac Photo Booth saves mirror images by default ("Auto Flip New Items"), so
+# its shots are flipped back on load. Left alone, the face would swap sides
+# (hair parting, asymmetries) every time the video cut between a Photo Booth
+# frame and a camera frame. Matched on Photo Booth's own file naming.
+PHOTO_BOOTH = re.compile(r"^(Photo|4-up|Movie) on \d{1,2}-\d{1,2}-\d{2,4} at ")
+
+# --- Identity (select). ---
+# OpenCV's published SFace cosine threshold for "same person".
+MATCH_MIN = 0.363
+# Stricter bar for a face to join the "this is me" set that other photos are
+# compared against. The set starts from work/me/ and grows by chaining
+# through similar-looking photos, which is how a 2004 face gets recognised
+# from a 2026 reference: each hop only has to bridge a few years. A strict
+# bar keeps a lookalike friend from joining and dragging the chain off.
+JOIN_MIN = 0.45
+# In a photo with several faces, the best match must beat the runner-up by
+# this much, or the photo is ambiguous rather than a match.
+MATCH_MARGIN = 0.08
+
 # --- Filter thresholds (select). Tune here after looking at review.html. ---
-# A face counts toward "group photo" only if it's at least this fraction of
-# the largest face's size, so strangers in the background don't reject a shot.
-GROUP_FACE_RATIO = 0.45
+# Another face only disqualifies a shot if it's at least this fraction of
+# your face's size (so distant strangers don't count) and lands inside the
+# output frame, with this much margin (fraction of canvas width) around it
+# for a face that would be half-visible at the edge.
+OTHER_FACE_RATIO = 0.45
+OTHER_FACE_MARGIN = 0.1
 # Minimum eye-centre distance in source pixels. Below this the face has to be
 # upscaled so far into the canvas that it reads as mush.
 MIN_EYE_DIST_PX = 70
@@ -112,12 +145,7 @@ def log(msg: str) -> None:
 
 def load_landmarker(num_faces: int) -> vision.FaceLandmarker:
     if not MODEL_PATH.exists():
-        sys.exit(
-            f"Missing model: {MODEL_PATH}\n"
-            "Download it with:\n  curl -L -o models/face_landmarker.task "
-            "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
-            "face_landmarker/float16/latest/face_landmarker.task"
-        )
+        sys.exit(f"Missing model: {MODEL_PATH}\nSee README.md → Setup.")
     options = vision.FaceLandmarkerOptions(
         # CPU explicitly: on macOS MediaPipe otherwise tries a Metal helper
         # that aborts the whole process when the GPU service is unavailable
@@ -130,15 +158,24 @@ def load_landmarker(num_faces: int) -> vision.FaceLandmarker:
     return vision.FaceLandmarker.create_from_options(options)
 
 
+def load_recognizer():
+    if not SFACE_PATH.exists():
+        sys.exit(f"Missing model: {SFACE_PATH}\nSee README.md → Setup.")
+    return cv2.FaceRecognizerSF.create(str(SFACE_PATH), "")
+
+
 def load_image(path: Path) -> tuple[Image.Image, Image.Image]:
     """Return (raw, upright RGB). The raw image keeps its EXIF for dating.
 
     exif_transpose matters: phone photos are usually stored sideways with an
     orientation tag, and every coordinate this tool records is in upright
     space, so detection and warping must both see the same upright pixels.
+    Photo Booth shots are un-mirrored here for the same reason.
     """
     raw = Image.open(path)
     upright = ImageOps.exif_transpose(raw).convert("RGB")
+    if PHOTO_BOOTH.match(path.name):
+        upright = ImageOps.mirror(upright)
     return raw, upright
 
 
@@ -155,6 +192,23 @@ def eye_centres(pts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     a = pts[list(EYE_A_CORNERS)].mean(axis=0)
     b = pts[list(EYE_B_CORNERS)].mean(axis=0)
     return a, b
+
+
+def embed(recognizer, bgr: np.ndarray, pts: np.ndarray) -> list[float]:
+    """Unit-length SFace identity vector for one face.
+
+    SFace's alignCrop expects YuNet's detection row (box + 5 landmarks, eyes
+    and mouth corners in image-left-first order); MediaPipe's mesh has all
+    five, so the row is built from it rather than running a second detector.
+    """
+    eye_a, eye_b = eye_centres(pts)
+    x0, y0 = pts.min(axis=0)
+    x1, y1 = pts.max(axis=0)
+    row = np.array([[x0, y0, x1 - x0, y1 - y0, *eye_a, *eye_b, *pts[NOSE_TIP],
+                     *pts[MOUTH_A], *pts[MOUTH_B], 1.0]], dtype=np.float32)
+    feature = recognizer.feature(recognizer.alignCrop(bgr, row)).flatten()
+    feature /= np.linalg.norm(feature)
+    return [round(float(v), 4) for v in feature]
 
 
 def similarity(src_a, src_b, dst_a, dst_b) -> np.ndarray:
@@ -194,6 +248,11 @@ class Framing:
         )
         area, _ = cv2.intersectConvexConvex(mapped, canvas)
         return float(area) / (self.width * self.height)
+
+    def in_frame(self, m: np.ndarray, point, margin: float) -> bool:
+        x, y = m[:, :2] @ np.asarray(point, float) + m[:, 2]
+        pad = margin * self.width
+        return -pad <= x <= self.width + pad and -pad <= y <= self.height + pad
 
     def warp(self, rgb: np.ndarray, eye_a, eye_b, scale: float = 1.0) -> np.ndarray:
         """Warp an upright RGB array. `scale` shrinks the canvas for previews.
@@ -243,6 +302,10 @@ def framing_from(args) -> Framing:
 DUP_SUFFIX = re.compile(r"\(\d+\)$")
 EDITED_SUFFIX = re.compile(r"-(edited|bearbeitet|modifié|editado)$", re.I)
 FILENAME_DATE = re.compile(r"(19|20)(\d{2})[-_]?(\d{2})[-_]?(\d{2})")
+# Photo Booth: "Photo on 9-25-17 at 12.42 PM #2", US month-day-year.
+PHOTO_BOOTH_DATE = re.compile(
+    r" on (\d{1,2})-(\d{1,2})-(\d{2}|\d{4}) at (\d{1,2})\.(\d{2})(?:\.(\d{2}))? ?(AM|PM)", re.I
+)
 
 
 class SidecarIndex:
@@ -303,6 +366,15 @@ def exif_datetime(raw: Image.Image) -> datetime | None:
 
 
 def filename_datetime(path: Path) -> datetime | None:
+    m = PHOTO_BOOTH_DATE.search(path.stem)
+    if m:
+        month, day, year, hour, minute, second, ampm = m.groups()
+        year = int(year) + (2000 if len(year) == 2 else 0)
+        hour = int(hour) % 12 + (12 if ampm.upper() == "PM" else 0)
+        try:
+            return datetime(year, int(month), int(day), hour, int(minute), int(second or 0))
+        except ValueError:
+            return None
     m = FILENAME_DATE.search(path.stem)
     if not m:
         return None
@@ -317,7 +389,7 @@ def date_photo(path: Path, raw: Image.Image, sidecars: SidecarIndex) -> tuple[st
 
     Order: Takeout sidecar (Google's own record, survives EXIF stripping by
     messaging apps), then EXIF, then a date in the filename. File mtime is
-    never used: after a Takeout download it's the download time.
+    never used: after a download or copy it's the copy time, not the shot.
     """
     ts = sidecars.lookup(path)
     if ts is not None:
@@ -333,7 +405,8 @@ def date_photo(path: Path, raw: Image.Image, sidecars: SidecarIndex) -> tuple[st
 # ---------------------------------------------------------------------------
 
 
-def measure_face(pts: np.ndarray, blendshapes, rgb: np.ndarray, scale_to_src: float) -> dict:
+def measure_face(pts: np.ndarray, blendshapes, rgb: np.ndarray, bgr: np.ndarray,
+                 recognizer, scale_to_src: float) -> dict:
     eye_a, eye_b = eye_centres(pts)
     axis = eye_b - eye_a
     eye_dist = float(np.hypot(*axis))
@@ -376,10 +449,11 @@ def measure_face(pts: np.ndarray, blendshapes, rgb: np.ndarray, scale_to_src: fl
         "yaw": round(yaw, 3),
         "blink": round(blink, 3),
         "sharpness": round(sharpness, 1),
+        "embedding": embed(recognizer, bgr, pts),
     }
 
 
-def scan_one(path: Path, landmarker, sidecars: SidecarIndex) -> dict:
+def scan_one(path: Path, landmarker, recognizer, sidecars: SidecarIndex) -> dict:
     raw, upright = load_image(path)
     taken, date_source = date_photo(path, raw, sidecars)
     src_w, src_h = upright.size
@@ -388,12 +462,13 @@ def scan_one(path: Path, landmarker, sidecars: SidecarIndex) -> dict:
     f = min(1.0, DETECT_MAX_SIDE / max(src_w, src_h))
     small = upright if f == 1 else upright.resize((round(src_w * f), round(src_h * f)), Image.LANCZOS)
     rgb = np.asarray(small)
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     result = detect(landmarker, rgb)
 
     faces = [
         measure_face(face_points(lm, rgb.shape[1], rgb.shape[0]),
                      result.face_blendshapes[i] if result.face_blendshapes else None,
-                     rgb, 1 / f)
+                     rgb, bgr, recognizer, 1 / f)
         for i, lm in enumerate(result.face_landmarks)
     ]
     faces.sort(key=lambda face: face["eye_dist"], reverse=True)
@@ -428,23 +503,25 @@ def cmd_scan(args) -> None:
     for p in paths:
         st = p.stat()
         hit = cache.get(str(p))
-        if not hit or hit.get("size") != st.st_size or hit.get("mtime") != int(st.st_mtime):
+        if (not hit or hit.get("v") != SCAN_VERSION or hit.get("size") != st.st_size
+                or hit.get("mtime") != int(st.st_mtime)):
             todo.append((p, st))
     log(f"{len(paths)} images found, {len(paths) - len(todo)} already scanned, {len(todo)} to scan")
     if not todo:
         return
 
-    # Six faces is plenty to recognise a group shot; the cap only bounds cost.
+    # Six faces is plenty to find you in a group shot; the cap only bounds cost.
     landmarker = load_landmarker(num_faces=6)
+    recognizer = load_recognizer()
     sidecars = SidecarIndex()
     started = time.time()
     # Append-only: Ctrl-C loses at most the photo in flight, and a re-run
     # picks up where this left off. Later lines for the same path win.
     with cache_path.open("a") as out:
         for i, (p, st) in enumerate(todo, 1):
-            rec = {"path": str(p), "size": st.st_size, "mtime": int(st.st_mtime)}
+            rec = {"path": str(p), "v": SCAN_VERSION, "size": st.st_size, "mtime": int(st.st_mtime)}
             try:
-                rec.update(scan_one(p, landmarker, sidecars))
+                rec.update(scan_one(p, landmarker, recognizer, sidecars))
                 rec["status"] = "ok"
             except Exception as exc:  # noqa: BLE001 - one bad file must not stop a 5k-photo scan
                 rec.update(status="error", error=f"{type(exc).__name__}: {exc}")
@@ -469,23 +546,54 @@ def load_scan(work: Path) -> list[dict]:
         if line.strip():
             rec = json.loads(line)
             latest[rec["path"]] = rec
-    return [r for r in latest.values() if Path(r["path"]).exists()]
+    records = [r for r in latest.values() if Path(r["path"]).exists()]
+    stale = sum(1 for r in records if r.get("v") != SCAN_VERSION)
+    if stale:
+        sys.exit(f"{stale} photos were scanned by an older version; re-run `scan` on the same folders.")
+    return records
 
 
 def read_list(path: Path) -> set[str]:
-    """exclude.txt / pin.txt: one path per line; `#` comments. A bare file
-    name also matches, so lines can be pasted from review.html's labels."""
-    if not path.exists():
-        return set()
+    """exclude.txt / pin.txt: one path per line. A bare file name also
+    matches, so lines can be pasted from review.html's labels.
+
+    Only whole-line `#` comments: Photo Booth names contain ` #2`, so a
+    trailing-comment rule would truncate them.
+    """
     items = set()
-    for line in path.read_text().splitlines():
-        line = line.split("#", 1)[0].strip()
-        if line:
-            items.add(line)
+    if path.exists():
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                items.add(line)
     return items
 
 
-def listed(rec: dict, items: set[str]) -> bool:
+def read_dates(path: Path) -> dict[str, str]:
+    """dates.txt: `<file name or path>  YYYY[-MM[-DD]]`, one per line.
+
+    The date is the last whitespace-separated token so file names may
+    contain spaces. A year alone lands mid-year and a month alone mid-month,
+    so a rough guess sorts roughly where it belongs.
+    """
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for n, line in enumerate(path.read_text().splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.rsplit(None, 1)
+        m = re.fullmatch(r"(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?", parts[-1]) if len(parts) == 2 else None
+        if not m:
+            log(f"  dates.txt line {n} ignored (want `<name>  YYYY[-MM[-DD]]`): {line}")
+            continue
+        y, mo, d = int(m.group(1)), int(m.group(2) or 7), int(m.group(3) or (15 if m.group(2) else 1))
+        out[parts[0].strip()] = datetime(y, mo, d, 12).strftime("%Y-%m-%dT%H:%M:%S")
+    return out
+
+
+def listed(rec: dict, items) -> bool:
     return rec["path"] in items or Path(rec["path"]).name in items
 
 
@@ -501,19 +609,115 @@ def period_key(taken: str, period: str) -> str:
     return f"{dt.year}-{dt.month:02d}"
 
 
+def reference_embeddings(work: Path) -> np.ndarray:
+    """Identity seed: every face-bearing photo in work/me/ (largest face)."""
+    me = work / "me"
+    paths = sorted(p for p in me.glob("*") if p.suffix.lower() in IMAGE_EXTS) if me.is_dir() else []
+    if not paths:
+        sys.exit(f"Put one or more clear photos of just you in {me}/ (the identity seed).")
+    landmarker, recognizer = load_landmarker(num_faces=1), load_recognizer()
+    refs = []
+    for p in paths:
+        _, upright = load_image(p)
+        f = min(1.0, DETECT_MAX_SIDE / max(upright.size))
+        if f < 1:
+            upright = upright.resize((round(upright.width * f), round(upright.height * f)), Image.LANCZOS)
+        rgb = np.asarray(upright)
+        result = detect(landmarker, rgb)
+        if not result.face_landmarks:
+            log(f"  no face found in reference {p.name}, skipped")
+            continue
+        pts = face_points(result.face_landmarks[0], rgb.shape[1], rgb.shape[0])
+        refs.append(embed(recognizer, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), pts))
+    if not refs:
+        sys.exit(f"No usable face in {me}/.")
+    return np.array(refs, dtype=np.float32)
+
+
+def assign_identity(records: list[dict], refs: np.ndarray) -> None:
+    """Decide which face in each photo is you. Sets rec["me"] (face index or
+    None), rec["me_best"] (best-matching index, for pins) and rec["me_sim"].
+
+    Grows a set of known-you faces from the seed: each round, a photo's best
+    face joins if it clears JOIN_MIN against the set and clearly beats every
+    other face in that photo. Repeat until nothing new joins. Chaining this
+    way recognises childhood photos a single adult reference never would,
+    while the margin rule stops a friend who's always beside you from
+    joining via a shared photo. Remaining photos are then matched once
+    against the final set at the looser MATCH_MIN.
+    """
+    owners, vecs = [], []
+    for ri, rec in enumerate(records):
+        for fi, face in enumerate(rec.get("faces") or []):
+            owners.append((ri, fi))
+            vecs.append(face["embedding"])
+    for rec in records:
+        rec["me"], rec["me_best"], rec["me_sim"] = None, None, 0.0
+    if not vecs:
+        return
+    emb = np.array(vecs, dtype=np.float32)
+    faces_of: dict[int, list[int]] = defaultdict(list)
+    for k, (ri, _) in enumerate(owners):
+        faces_of[ri].append(k)
+
+    members: list[int] = []
+    joined: set[int] = set()
+
+    def best_per_photo(threshold: float) -> dict[int, tuple[int, float]]:
+        pool = np.vstack([refs, emb[members]]) if members else refs
+        sims = emb @ pool.T
+        if members:
+            # A member must not match itself.
+            sims[members, len(refs) + np.arange(len(members))] = -1
+        best = sims.max(axis=1)
+        picks = {}
+        for ri, ks in faces_of.items():
+            if ri in joined:
+                continue
+            order = sorted(ks, key=lambda k: best[k], reverse=True)
+            top = order[0]
+            runner = best[order[1]] if len(order) > 1 else -1.0
+            records[ri]["me_best"], records[ri]["me_sim"] = owners[top][1], round(float(best[top]), 3)
+            if best[top] >= threshold and best[top] - runner >= MATCH_MARGIN:
+                picks[ri] = (top, float(best[top]))
+        return picks
+
+    for _ in range(50):
+        picks = best_per_photo(JOIN_MIN)
+        if not picks:
+            break
+        for ri, (k, _) in picks.items():
+            joined.add(ri)
+            members.append(k)
+            records[ri]["me"] = owners[k][1]
+    for ri, (k, _) in best_per_photo(MATCH_MIN).items():
+        records[ri]["me"] = owners[k][1]
+    for ri in joined:
+        # me_best/me_sim were last written before the photo joined; they're
+        # still its score at the time it was accepted, which is what the
+        # review page should show.
+        records[ri]["me_best"] = records[ri]["me"]
+
+
 def evaluate(rec: dict, framing: Framing) -> tuple[str | None, float, dict]:
-    """(reject reason or None, score in 0..1, primary face)."""
+    """(reject reason or None, score in 0..1, your face in this photo)."""
     if rec.get("status") != "ok":
         return "unreadable", 0.0, {}
-    if not rec.get("taken"):
-        return "no date", 0.0, {}
     faces = rec.get("faces") or []
     if not faces:
         return "no face", 0.0, {}
-    face = faces[0]
-    significant = [f for f in faces if f["eye_dist"] >= GROUP_FACE_RATIO * face["eye_dist"]]
-    if len(significant) > 1:
-        return "group photo", 0.0, face
+    face = faces[rec["me"] if rec["me"] is not None else rec["me_best"]]
+    if not rec.get("taken"):
+        return "no date", 0.0, face
+    if rec["me"] is None:
+        return "not recognised as you", 0.0, face
+    m = framing.matrix(face["eye_a"], face["eye_b"])
+    for other in faces:
+        if other is face or other["eye_dist"] < OTHER_FACE_RATIO * face["eye_dist"]:
+            continue
+        centre = (np.asarray(other["eye_a"]) + np.asarray(other["eye_b"])) / 2
+        if framing.in_frame(m, centre, OTHER_FACE_MARGIN):
+            return "someone else in frame", 0.0, face
     if face["eye_dist"] < MIN_EYE_DIST_PX:
         return "face too small", 0.0, face
     if abs(face["yaw"]) > MAX_YAW:
@@ -537,15 +741,27 @@ def evaluate(rec: dict, framing: Framing) -> tuple[str | None, float, dict]:
     return None, round(score, 4), face
 
 
-def thumb(rec: dict, face: dict, framing: Framing, thumbs: Path, size: int = 180) -> str:
-    """Aligned preview thumbnail, cached by path+mtime. Previews the real
-    framing so review.html shows what each pick will look like as a frame."""
-    key = hashlib.sha1(f"{rec['path']}|{rec['mtime']}|{framing.__dict__}".encode()).hexdigest()[:16]
+def aligned_thumb(rec: dict, face: dict, framing: Framing, thumbs: Path, size: int = 180) -> str:
+    """Aligned preview, cached by path+mtime+framing, so review.html shows
+    what each pick will actually look like as a frame."""
+    key = hashlib.sha1(f"{rec['path']}|{rec['mtime']}|{framing.__dict__}|{face['eye_a']}".encode()).hexdigest()[:16]
     out = thumbs / f"{key}.jpg"
     if not out.exists():
         _, upright = load_image(Path(rec["path"]))
         img = framing.warp(np.asarray(upright), face["eye_a"], face["eye_b"], scale=size / framing.width)
         Image.fromarray(img).save(out, quality=82)
+    return f"thumbs/{out.name}"
+
+
+def plain_thumb(rec: dict, thumbs: Path, size: int = 140) -> str:
+    """Whole-photo preview for rejects: the problem (a friend in frame, a
+    turned head, the wrong face picked) is usually visible only uncropped."""
+    key = hashlib.sha1(f"plain|{rec['path']}|{rec['mtime']}".encode()).hexdigest()[:16]
+    out = thumbs / f"{key}.jpg"
+    if not out.exists():
+        _, upright = load_image(Path(rec["path"]))
+        upright.thumbnail((size, size))
+        upright.save(out, quality=78)
     return f"thumbs/{out.name}"
 
 
@@ -555,133 +771,166 @@ def cmd_select(args) -> None:
     records = load_scan(work)
     exclude = read_list(work / "exclude.txt")
     pins = read_list(work / "pin.txt")
+    dates = read_dates(work / "dates.txt")
 
     reasons: dict[str, int] = defaultdict(int)
-    by_period: dict[str, list[tuple[float, dict, dict]]] = defaultdict(list)
-    rejected_by_period: dict[str, int] = defaultdict(int)
-    pinned_by_period: dict[str, list[tuple[float, dict, dict]]] = defaultdict(list)
-
-    # Same timestamp to the second = the same shot (an edited copy, or the
-    # photo sitting in two albums). Keep only the better-scoring copy.
-    seen_taken: dict[str, tuple[float, dict, dict]] = {}
+    reasons["excluded"] = sum(1 for r in records if listed(r, exclude))
+    # Excluded photos also stay out of the identity chain: excluding a
+    # wrongly-matched photo is how you cut a bad link.
+    records = [r for r in records if not listed(r, exclude)]
     for rec in records:
-        if listed(rec, exclude):
-            reasons["excluded"] += 1
-            continue
+        override = dates.get(rec["path"]) or dates.get(Path(rec["path"]).name)
+        if override:
+            rec["taken"], rec["date_source"] = override, "dates.txt"
+
+    assign_identity(records, reference_embeddings(work))
+
+    # Keyed by taken time to the minute: Photo Booth only records minutes,
+    # and its bursts (`#2`, `#3`) and duplicate copies (`(1)`) share one. The
+    # best-scoring shot of each minute survives.
+    usable: dict[str, tuple[float, dict, dict]] = {}
+    rejected: list[tuple[dict, str, dict]] = []
+    for rec in records:
         reason, score, face = evaluate(rec, framing)
         pinned = listed(rec, pins)
-        if reason and not (pinned and face and rec.get("taken")):
-            reasons[reason] += 1
-            if rec.get("taken"):
-                rejected_by_period[period_key(rec["taken"], args.period)] += 1
-            continue
-        if pinned and reason:
+        if reason and pinned and face and rec.get("taken"):
             # A pin overrides the filters (you know better than a yaw proxy),
-            # but still needs a detected face to align on and a date to sort by.
-            face = {**face, "coverage": face.get("coverage", 1.0)}
-        prev = seen_taken.get(rec["taken"])
-        if prev and prev[0] >= score:
+            # but still needs a face to align on and a date to sort by.
+            reason = None
+        if reason:
+            reasons[reason] += 1
+            rejected.append((rec, reason, face))
+            continue
+        key = rec["taken"][:16]
+        prev = usable.get(key)
+        if prev and (prev[0] >= score or listed(prev[1], pins)) and not pinned:
             reasons["duplicate"] += 1
+            rejected.append((rec, "duplicate", face))
             continue
         if prev:
             reasons["duplicate"] += 1
-        seen_taken[rec["taken"]] = (score, rec, face)
+            rejected.append((prev[1], "duplicate", prev[2]))
+        usable[key] = (score, rec, face)
 
-    for score, rec, face in seen_taken.values():
-        key = period_key(rec["taken"], args.period)
-        if listed(rec, pins):
-            pinned_by_period[key].append((score, rec, face))
+    by_period: dict[str, list[tuple[float, dict, dict]]] = defaultdict(list)
+    for score, rec, face in usable.values():
+        by_period[period_key(rec["taken"], "month" if args.period == "all" else args.period)].append(
+            (score, rec, face))
+    chosen: list[tuple[float, dict, dict]] = []
+    for key, items in by_period.items():
+        # Pins first, then by score, so a period's pick is at the front.
+        items.sort(key=lambda t: (not listed(t[1], pins), -t[0]))
+        if args.period == "all":
+            chosen.extend(t for t in items if t[0] >= args.min_score or listed(t[1], pins))
         else:
-            by_period[key].append((score, rec, face))
-
-    chosen: list[tuple[str, float, dict, dict]] = []
-    periods = sorted(set(by_period) | set(pinned_by_period))
-    for key in periods:
-        by_period[key].sort(key=lambda t: t[0], reverse=True)
-        if pinned_by_period[key]:
-            picks = pinned_by_period[key]
-        elif by_period[key] and by_period[key][0][0] >= args.min_score:
-            picks = by_period[key][:1]
-        else:
-            picks = []
-        chosen.extend((key, s, r, f) for s, r, f in picks)
-    chosen.sort(key=lambda t: t[2]["taken"])
+            pinned = [t for t in items if listed(t[1], pins)]
+            if pinned:
+                chosen.extend(pinned)
+            elif items[0][0] >= args.min_score:
+                chosen.append(items[0])
+    chosen.sort(key=lambda t: t[1]["taken"])
 
     with (work / "selection.csv").open("w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["period", "taken", "score", "pinned", "path", "eye_a_x", "eye_a_y", "eye_b_x", "eye_b_y"])
-        for key, score, rec, face in chosen:
-            w.writerow([key, rec["taken"], score, int(listed(rec, pins)), rec["path"],
-                        *face["eye_a"], *face["eye_b"]])
+        w.writerow(["taken", "score", "pinned", "path", "eye_a_x", "eye_a_y", "eye_b_x", "eye_b_y"])
+        for score, rec, face in chosen:
+            w.writerow([rec["taken"], score, int(listed(rec, pins)), rec["path"], *face["eye_a"], *face["eye_b"]])
 
     thumbs = work / "thumbs"
     thumbs.mkdir(exist_ok=True)
-    write_review(work, periods, chosen, by_period, pinned_by_period, rejected_by_period,
-                 reasons, framing, thumbs, args)
+    write_review(work, chosen, by_period, rejected, reasons, framing, thumbs, pins, args)
 
-    total = len(records)
-    log(f"{total} scanned photos → {len(seen_taken)} usable → {len(chosen)} frames "
-        f"across {len({c[0] for c in chosen})} of {len(periods)} {args.period}s with candidates")
+    log(f"{len(records) + reasons['excluded']} scanned photos → {len(chosen)} frames")
     for reason, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
-        log(f"  {n:6d}  {reason}")
+        if n:
+            log(f"  {n:6d}  {reason}")
     if chosen:
-        log(f"Span: {chosen[0][2]['taken'][:10]} → {chosen[-1][2]['taken'][:10]}")
+        log(f"Span: {chosen[0][1]['taken'][:10]} → {chosen[-1][1]['taken'][:10]}")
     log(f"Review: {work / 'review.html'}")
 
 
-def write_review(work, periods, chosen, by_period, pinned_by_period, rejected_by_period,
-                 reasons, framing, thumbs, args) -> None:
-    """Static contact sheet: one row per period, the pick first, then the
-    runners-up. Pin/exclude buttons collect paths into two boxes at the top
-    to paste into pin.txt / exclude.txt, then re-run `select`."""
-    chosen_paths = {c[2]["path"] for c in chosen}
+def write_review(work, chosen, by_period, rejected, reasons, framing, thumbs, pins, args) -> None:
+    """Static contact sheet, one section per period: usable photos (the
+    frames, outlined green) cropped as they'll appear, then that period's
+    rejects uncropped with their reason, and undated photos at the end.
+    Pin/exclude buttons collect names into boxes at the top to paste into
+    pin.txt / exclude.txt (or dates.txt for undated ones), then re-run
+    `select`."""
     esc = html.escape
-    rows = []
-    for key in periods:
-        cands = pinned_by_period[key] + by_period[key][: args.alternates + 1]
+    chosen_paths = {c[1]["path"] for c in chosen}
+    group_period = "month" if args.period == "all" else args.period
+    rejected_by: dict[str, list] = defaultdict(list)
+    for rec, reason, face in rejected:
+        key = period_key(rec["taken"], group_period) if rec.get("taken") else "undated"
+        rejected_by[key].append((rec, reason, face))
+
+    def buttons(rec):
+        name = esc(Path(rec["path"]).name)
+        return (f'<button data-list="pin" data-name="{name}">pin</button>'
+                f'<button data-list="exclude" data-name="{name}">exclude</button>')
+
+    sections = []
+    keys = sorted(set(by_period) | {k for k in rejected_by if k != "undated"})
+    if "undated" in rejected_by:
+        keys.append("undated")
+    for key in keys:
         cells = []
-        for score, rec, face in cands:
-            src = thumb(rec, face, framing, thumbs)
+        items = by_period.get(key, [])
+        if args.period != "all":
+            items = items[: args.alternates + 1]
+        for score, rec, face in items:
             picked = rec["path"] in chosen_paths
             cells.append(
                 f'<figure class="{"pick" if picked else ""}">'
-                f'<img loading="lazy" src="{esc(src)}" title="{esc(rec["path"])}">'
-                f'<figcaption>{esc(rec["taken"][:10])} · {score:.2f}<br>'
-                f'<span class="name">{esc(Path(rec["path"]).name)}</span><br>'
-                f'<button data-list="pin" data-path="{esc(rec["path"])}">pin</button>'
-                f'<button data-list="exclude" data-path="{esc(rec["path"])}">exclude</button>'
-                f'</figcaption></figure>'
-            )
-        n_cands = len(by_period[key]) + len(pinned_by_period[key])
-        rows.append(
-            f'<section><h2>{esc(key)} <small>{n_cands} usable · '
-            f'{rejected_by_period.get(key, 0)} rejected</small></h2>'
-            f'<div class="row">{"".join(cells) or "<em>nothing usable</em>"}</div></section>'
-        )
-    summary = " · ".join(f"{esc(k)}: {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1]))
+                f'<img loading="lazy" src="{esc(aligned_thumb(rec, face, framing, thumbs))}" '
+                f'title="{esc(rec["path"])}"><figcaption>{esc(rec["taken"][:16].replace("T", " "))} · '
+                f'{score:.2f} · you {rec["me_sim"]:.2f}{" · pinned" if listed(rec, pins) else ""}<br>'
+                f'<span class="name">{esc(Path(rec["path"]).name)}</span><br>{buttons(rec)}'
+                f'</figcaption></figure>')
+        rej = []
+        for rec, reason, _ in sorted(rejected_by.get(key, []), key=lambda t: t[1]):
+            match = f' · you {rec["me_sim"]:.2f}' if rec.get("faces") else ""
+            rej.append(
+                f'<figure class="rej"><img loading="lazy" src="{esc(plain_thumb(rec, thumbs))}" '
+                f'title="{esc(rec["path"])}"><figcaption><b>{esc(reason)}</b>{match}<br>'
+                f'<span class="name">{esc(Path(rec["path"]).name)}</span><br>{buttons(rec)}'
+                f'</figcaption></figure>')
+        n_rej = len(rejected_by.get(key, []))
+        heading = "undated: add these to dates.txt" if key == "undated" else key
+        sections.append(
+            f'<section><h2>{esc(heading)} <small>{len(by_period.get(key, []))} usable · {n_rej} rejected</small></h2>'
+            f'<div class="row">{"".join(cells)}</div>'
+            + (f'<details{" open" if key == "undated" else ""}><summary>{n_rej} rejected</summary>'
+               f'<div class="row">{"".join(rej)}</div></details>' if rej else "")
+            + '</section>')
+
+    summary = " · ".join(f"{esc(k)}: {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1]) if v)
+    mode = "every usable photo" if args.period == "all" else f"best per {esc(args.period)}"
     page = f"""<!doctype html><meta charset="utf-8"><title>Facelapse review</title>
 <style>
  body{{font:13px system-ui;margin:16px;background:#111;color:#ddd}}
- h1{{font-size:18px}} h2{{font-size:14px;margin:18px 0 6px}} small{{color:#888;font-weight:400}}
+ h1{{font-size:18px}} h2{{font-size:14px;margin:22px 0 6px}} small{{color:#888;font-weight:400}}
  .row{{display:flex;gap:8px;flex-wrap:wrap}}
- figure{{margin:0;width:180px;opacity:.75}} figure.pick{{opacity:1;outline:3px solid #4c9;}}
+ figure{{margin:0;width:180px;opacity:.7}} figure.pick{{opacity:1;outline:3px solid #4c9}}
+ figure.rej{{width:140px}} figure.rej img{{width:140px}}
  img{{width:180px;height:auto;display:block}} figcaption{{font-size:11px;padding:3px 0}}
  .name{{color:#999;word-break:break-all}} button{{font-size:11px;margin:2px 2px 0 0}}
+ details{{margin-top:6px}} summary{{cursor:pointer;color:#aaa}}
  textarea{{width:100%;height:70px;background:#222;color:#ddd;font:11px ui-monospace,monospace}}
- .lists{{display:grid;grid-template-columns:1fr 1fr;gap:12px;position:sticky;top:0;background:#111;padding:6px 0}}
+ .lists{{display:grid;grid-template-columns:1fr 1fr;gap:12px;position:sticky;top:0;background:#111;padding:6px 0;z-index:1}}
 </style>
-<h1>Facelapse review — {len(chosen)} frames, {esc(args.period)}ly</h1>
-<p>Green outline = current pick. Rejected: {summary}</p>
+<h1>Facelapse review: {len(chosen)} frames ({mode})</h1>
+<p>Green outline = a frame. "you" = identity match (≥{MATCH_MIN} counts). Rejected: {summary}</p>
 <div class="lists">
  <label>append to pin.txt<textarea id="pin"></textarea></label>
  <label>append to exclude.txt<textarea id="exclude"></textarea></label>
 </div>
-{"".join(rows)}
+{"".join(sections)}
 <script>
 document.addEventListener('click', e => {{
   const b = e.target.closest('button[data-list]'); if (!b) return;
   const box = document.getElementById(b.dataset.list);
-  if (!box.value.includes(b.dataset.path)) box.value += b.dataset.path + '\\n';
+  if (!box.value.split('\\n').includes(b.dataset.name)) box.value += b.dataset.name + '\\n';
   b.disabled = true;
 }});
 </script>"""
@@ -715,7 +964,7 @@ def refine_eyes(landmarker, upright: np.ndarray, eye_a, eye_b):
     if not result.face_landmarks:
         return eye_a, eye_b, False
     # The crop can still contain a neighbour's face; take the one nearest the
-    # face we came for.
+    # face select identified as you.
     best = None
     for lm in result.face_landmarks:
         a, b = eye_centres(face_points(lm, crop.shape[1], crop.shape[0]))
@@ -824,16 +1073,20 @@ def main() -> None:
     parser.add_argument("--work", default=str(ROOT / "work"), help="working/output folder (default: ./work)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("scan", help="detect + date every photo (cached, resumable)")
-    p.add_argument("sources", nargs="+", help="photo folders, e.g. an unzipped Takeout album")
+    p = sub.add_parser("scan", help="detect, fingerprint + date every photo (cached, resumable)")
+    p.add_argument("sources", nargs="+", help="photo folders")
     p.set_defaults(fn=cmd_scan)
 
-    p = sub.add_parser("select", help="filter, score, pick one per period, write review.html")
+    p = sub.add_parser("select", help="find you, filter, pick frames, write review.html")
     add_framing_args(p)
-    p.add_argument("--period", choices=["week", "month", "quarter", "year"], default="month")
+    # "all" by default (decided on #457): every usable photo becomes a frame
+    # in date order, so dense stretches play longer than sparse ones. The
+    # per-period modes remain for a time-even cut.
+    p.add_argument("--period", choices=["all", "week", "month", "quarter", "year"], default="all")
     p.add_argument("--min-score", type=float, default=0.0,
-                   help="leave a period empty rather than use a pick scoring below this")
-    p.add_argument("--alternates", type=int, default=4, help="runners-up shown per period in review.html")
+                   help="drop frames scoring below this (per-period modes: leave the period empty)")
+    p.add_argument("--alternates", type=int, default=4,
+                   help="per-period modes: runners-up shown per period in review.html")
     p.set_defaults(fn=cmd_select)
 
     p = sub.add_parser("align", help="warp selected photos into eye-aligned frames")

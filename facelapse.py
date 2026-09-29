@@ -1424,9 +1424,14 @@ def main() -> None:
     p = sub.add_parser("polaroid", help="render the stacked-polaroid version")
     p.add_argument("--bg", default="light", help="'light', 'dark' (the site's backgrounds) or a #hex colour")
     p.add_argument("--size", type=int, default=1080, help="square video size in px")
-    p.add_argument("--window", type=float, default=0.62,
+    # 0.58 leaves room for a strongly tilted card's corners to swing out
+    # without being cut off by the video's edge (0.68 was, visibly). How
+    # zoomed out each photo is comes from --eye-dist, not this.
+    p.add_argument("--window", type=float, default=0.58,
                    help="photo window width as a fraction of the video (the card adds its border)")
-    p.add_argument("--eye-dist", type=float, default=0.15,
+    # Zoomed out on the first landing-page review (#458): more of each
+    # photo's surroundings (places, colour) and less of just a face.
+    p.add_argument("--eye-dist", type=float, default=0.11,
                    help="eye spacing as a fraction of the photo window (smaller = zoomed further out)")
     p.add_argument("--edge-rate", type=float, default=5, help="photos/s at the start and end")
     p.add_argument("--peak-rate", type=float, default=22, help="photos/s in the middle")

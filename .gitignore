@@ -1,0 +1,8 @@
+# Photos of a real person never go in git: source photos, the working
+# folder (thumbnails, frames, video) and the synthetic test set all stay local.
+work/
+test/
+models/
+.venv/
+__pycache__/
+*.zip

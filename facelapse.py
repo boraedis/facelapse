@@ -816,7 +816,10 @@ def cmd_select(args) -> None:
             reasons[reason] += 1
             rejected.append((rec, reason, face))
             continue
-        key = rec["taken"][:16]
+        # A dates.txt date is a hand-entered month or year pinned to noon on
+        # a fixed day, not a real timestamp: every photo guessed "2021-06"
+        # shares one, so those are never treated as same-minute duplicates.
+        key = rec["path"] if rec.get("date_source") == "dates.txt" else rec["taken"][:16]
         prev = usable.get(key)
         if prev and (prev[0] >= score or listed(prev[1], pins)) and not pinned:
             reasons["duplicate"] += 1

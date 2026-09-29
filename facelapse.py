@@ -69,7 +69,8 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp"}
 
 # Bump when scan's output changes shape or meaning; older cache lines are
 # rescanned. v2: face embeddings, Photo Booth dates, Photo Booth un-mirroring.
-SCAN_VERSION = 2
+# v3: head yaw/pitch in degrees from MediaPipe's pose matrix.
+SCAN_VERSION = 3
 
 # Detection runs on a downscaled copy: MediaPipe's detector works at a few
 # hundred px internally anyway, and decoding + scanning thousands of 12MP
@@ -87,8 +88,6 @@ EYE_B_CORNERS = (362, 263)  # subject's left eye (image right)
 NOSE_TIP = 1
 MOUTH_A = 61                # mouth corner, image left
 MOUTH_B = 291               # mouth corner, image right
-CHEEK_A = 234
-CHEEK_B = 454
 
 # Mac Photo Booth saves mirror images by default ("Auto Flip New Items"), so
 # its shots are flipped back on load. Left alone, the face would swap sides
@@ -122,10 +121,14 @@ OTHER_FACE_MARGIN = 0.1
 # Minimum eye-centre distance in source pixels. Below this the face has to be
 # upscaled so far into the canvas that it reads as mush.
 MIN_EYE_DIST_PX = 45
-# Head-turn proxy in [-1, 1]: nose-to-cheek asymmetry along the eye line.
-# ~0 is frontal; 0.2 is a noticeable three-quarter turn, 0.45 about as far
-# as still reads as a face-on frame (true profiles score 0.8+).
-MAX_YAW = 0.45
+# Head pose in degrees, from MediaPipe's 3D pose estimate. Yaw is turning
+# side to side, pitch is looking up or down. Tightened again after the
+# loosened run (#457): frontalizing turned faces in 2D distorted them, so
+# the remaining lever is not letting strongly turned ones in. Typical frames
+# sit at ~2° yaw and ~5° pitch; pitch gets more room because phone selfies
+# are routinely shot from a little below.
+MAX_YAW_DEG = 15
+MAX_PITCH_DEG = 20
 # Head tilt in degrees. Alignment removes roll entirely, but a heavily tilted
 # head usually means a lying-down or goofy shot that looks off once levelled.
 MAX_ROLL_DEG = 40
@@ -158,6 +161,7 @@ def load_landmarker(num_faces: int) -> vision.FaceLandmarker:
         base_options=BaseOptions(model_asset_path=str(MODEL_PATH), delegate=BaseOptions.Delegate.CPU),
         num_faces=num_faces,
         output_face_blendshapes=True,
+        output_facial_transformation_matrixes=True,
     )
     return vision.FaceLandmarker.create_from_options(options)
 
@@ -409,21 +413,24 @@ def date_photo(path: Path, raw: Image.Image, sidecars: SidecarIndex) -> tuple[st
 # ---------------------------------------------------------------------------
 
 
-def measure_face(pts: np.ndarray, blendshapes, rgb: np.ndarray, bgr: np.ndarray,
+def head_pose(matrix) -> tuple[float, float]:
+    """(yaw, pitch) in degrees from MediaPipe's facial transformation matrix
+    (canonical face model -> camera). Only magnitudes are used downstream, so
+    sign conventions don't matter; verified on real frames that the turned
+    and up/down-looking shots are the ones that score high."""
+    r = np.asarray(matrix)[:3, :3]
+    yaw = math.degrees(math.asin(float(np.clip(-r[2, 0], -1, 1))))
+    pitch = math.degrees(math.atan2(r[2, 1], r[2, 2]))
+    return yaw, pitch
+
+
+def measure_face(pts: np.ndarray, blendshapes, matrix, rgb: np.ndarray, bgr: np.ndarray,
                  recognizer, scale_to_src: float) -> dict:
     eye_a, eye_b = eye_centres(pts)
     axis = eye_b - eye_a
     eye_dist = float(np.hypot(*axis))
-    unit = axis / eye_dist
     roll = math.degrees(math.atan2(axis[1], axis[0]))
-
-    # Yaw proxy: project nose and both cheek edges onto the eye axis. A
-    # frontal face has the nose midway between the cheeks; turning the head
-    # slides it toward one side. Convention-free, unlike decomposing
-    # MediaPipe's transform matrix.
-    nose, ca, cb = (float(pts[i] @ unit) for i in (NOSE_TIP, CHEEK_A, CHEEK_B))
-    da, db = abs(nose - ca), abs(cb - nose)
-    yaw = (da - db) / (da + db) if da + db else 1.0
+    yaw, pitch = head_pose(matrix) if matrix is not None else (90.0, 90.0)
 
     blink = 0.0
     if blendshapes:
@@ -450,7 +457,8 @@ def measure_face(pts: np.ndarray, blendshapes, rgb: np.ndarray, bgr: np.ndarray,
         "eye_b": [round(v * scale_to_src, 2) for v in eye_b],
         "eye_dist": round(eye_dist * scale_to_src, 2),
         "roll": round(roll, 2),
-        "yaw": round(yaw, 3),
+        "yaw_deg": round(yaw, 1),
+        "pitch_deg": round(pitch, 1),
         "blink": round(blink, 3),
         "sharpness": round(sharpness, 1),
         "embedding": embed(recognizer, bgr, pts),
@@ -472,6 +480,7 @@ def scan_one(path: Path, landmarker, recognizer, sidecars: SidecarIndex) -> dict
     faces = [
         measure_face(face_points(lm, rgb.shape[1], rgb.shape[0]),
                      result.face_blendshapes[i] if result.face_blendshapes else None,
+                     result.facial_transformation_matrixes[i] if result.facial_transformation_matrixes else None,
                      rgb, bgr, recognizer, 1 / f)
         for i, lm in enumerate(result.face_landmarks)
     ]
@@ -724,8 +733,10 @@ def evaluate(rec: dict, framing: Framing) -> tuple[str | None, float, dict]:
             return "someone else in frame", 0.0, face
     if face["eye_dist"] < MIN_EYE_DIST_PX:
         return "face too small", 0.0, face
-    if abs(face["yaw"]) > MAX_YAW:
+    if abs(face["yaw_deg"]) > MAX_YAW_DEG:
         return "head turned", 0.0, face
+    if abs(face["pitch_deg"]) > MAX_PITCH_DEG:
+        return "looking up/down", 0.0, face
     if abs(face["roll"]) > MAX_ROLL_DEG:
         return "head tilted", 0.0, face
     if face["blink"] > MAX_BLINK:
@@ -735,7 +746,7 @@ def evaluate(rec: dict, framing: Framing) -> tuple[str | None, float, dict]:
     if coverage < MIN_COVERAGE:
         return "face at photo edge", 0.0, face
 
-    frontal = 1 - abs(face["yaw"]) / MAX_YAW
+    frontal = 1 - (abs(face["yaw_deg"]) / MAX_YAW_DEG + abs(face["pitch_deg"]) / MAX_PITCH_DEG) / 2
     # Resolution: 1.0 once the source eyes are at least as far apart as the
     # canvas slot, i.e. the frame never needs upscaling.
     resolution = min(1.0, face["eye_dist"] / framing.eye_px)
@@ -798,7 +809,7 @@ def cmd_select(args) -> None:
         reason, score, face = evaluate(rec, framing)
         pinned = listed(rec, pins)
         if reason and pinned and face and rec.get("taken"):
-            # A pin overrides the filters (you know better than a yaw proxy),
+            # A pin overrides the filters (you know better than a pose estimate),
             # but still needs a face to align on and a date to sort by.
             reason = None
         if reason:

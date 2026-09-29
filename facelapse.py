@@ -491,7 +491,9 @@ def scan_one(path: Path, landmarker, recognizer, sidecars: SidecarIndex) -> dict
 
 def iter_images(sources: list[Path]):
     for source in sources:
-        for path in sorted(source.rglob("*")):
+        # Single files are accepted too, e.g. a portrait kept outside the
+        # photo folders that final.txt closes the sequence with.
+        for path in [source] if source.is_file() else sorted(source.rglob("*")):
             if path.suffix.lower() in IMAGE_EXTS and path.is_file() and not path.name.startswith("."):
                 yield path
 
@@ -509,8 +511,8 @@ def cmd_scan(args) -> None:
 
     sources = [Path(s).expanduser().resolve() for s in args.sources]
     for s in sources:
-        if not s.is_dir():
-            sys.exit(f"Not a folder: {s}")
+        if not s.exists():
+            sys.exit(f"Not found: {s}")
     paths = list(iter_images(sources))
     todo = []
     for p in paths:
@@ -847,6 +849,24 @@ def cmd_select(args) -> None:
             elif items[0][0] >= args.min_score:
                 chosen.append(items[0])
     chosen.sort(key=lambda t: t[1]["taken"])
+
+    # final.txt: one photo that always closes the sequence, whatever its
+    # date and past every filter (like a pin). It's the frame the video
+    # settles on and the poster, so it's worth choosing by hand: on the
+    # landing page it's the same portrait as /about-me.
+    final_name = next(iter(read_list(work / "final.txt")), None)
+    if final_name:
+        final = next((r for r in records if listed(r, {final_name})), None)
+        if final is None:
+            sys.exit(f"final.txt names {final_name!r}, which hasn't been scanned; run `scan` on it first.")
+        if final["me"] is None and final.get("faces"):
+            final["me"] = final["me_best"]
+        if not final.get("taken"):
+            final["taken"] = chosen[-1][1]["taken"] if chosen else "2000-01-01T00:00:00"
+        _, score, face = evaluate(final, framing)
+        if not face:
+            sys.exit(f"No face found in the final photo {final_name!r}.")
+        chosen = [c for c in chosen if c[1]["path"] != final["path"]] + [(score, final, face)]
 
     with (work / "selection.csv").open("w", newline="") as fh:
         w = csv.writer(fh)

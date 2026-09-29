@@ -78,6 +78,10 @@ $PY facelapse.py encode --blend    # work/facelapse.mp4 + poster.jpg/.webp
   (gamma, so backgrounds don't blow out) and colour cast are pulled toward the
   median frame. `--color 0` turns it off, `--color 1` matches fully (default 0.8).
 - **encode** plays 12 photos a second by default (`--fps`).
+- `work/final.txt` names one photo that always closes the sequence (past
+  every filter, whatever its date): the frame the video settles on and the
+  poster. `scan` accepts single files as well as folders, so it can live
+  outside the photo folders.
 - **polaroid** renders the landing-page hero version: each photo drops onto a
   growing pile of polaroids, eye-aligned, speeding up through the middle
   (`--edge-rate`/`--peak-rate`) and landing on the latest photo. Cards show

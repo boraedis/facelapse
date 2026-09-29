@@ -110,6 +110,9 @@ JOIN_MIN = 0.45
 MATCH_MARGIN = 0.08
 
 # --- Filter thresholds (select). Tune here after looking at review.html. ---
+# Loosened on #457 after the first real run: in a fast timelapse a slightly
+# turned or tilted face flashes by fine, and more photos (especially the
+# sparse early years and a recent final frame) beat stricter quality.
 # Another face only disqualifies a shot if it's at least this fraction of
 # your face's size (so distant strangers don't count) and lands inside the
 # output frame, with this much margin (fraction of canvas width) around it
@@ -118,20 +121,21 @@ OTHER_FACE_RATIO = 0.45
 OTHER_FACE_MARGIN = 0.1
 # Minimum eye-centre distance in source pixels. Below this the face has to be
 # upscaled so far into the canvas that it reads as mush.
-MIN_EYE_DIST_PX = 70
+MIN_EYE_DIST_PX = 45
 # Head-turn proxy in [-1, 1]: nose-to-cheek asymmetry along the eye line.
-# ~0 is frontal; 0.2 is a noticeable three-quarter turn.
-MAX_YAW = 0.22
+# ~0 is frontal; 0.2 is a noticeable three-quarter turn, 0.45 about as far
+# as still reads as a face-on frame (true profiles score 0.8+).
+MAX_YAW = 0.45
 # Head tilt in degrees. Alignment removes roll entirely, but a heavily tilted
 # head usually means a lying-down or goofy shot that looks off once levelled.
-MAX_ROLL_DEG = 25
+MAX_ROLL_DEG = 40
 # MediaPipe blendshape eyeBlink score (0 open .. 1 closed). Squints score
 # ~0.3-0.4, so this rejects only genuinely closed eyes.
-MAX_BLINK = 0.5
+MAX_BLINK = 0.65
 # Fraction of the output canvas the source photo must cover once aligned.
 # Faces near a photo's edge leave a gap that gets filled with smeared edge
 # pixels; a sliver is fine, a quarter of the frame is not.
-MIN_COVERAGE = 0.9
+MIN_COVERAGE = 0.75
 
 
 # ---------------------------------------------------------------------------
